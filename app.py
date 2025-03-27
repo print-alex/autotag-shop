@@ -58,6 +58,13 @@ def extract_vehicle_data(title):
 def get_vehicle_tags(vehicle_data):
     """Generează etichete bazate pe datele vehiculului"""
     tags = set()
+
+    # Check if required fields are None; if so, return empty tags
+    required_fields = ['brand', 'model', 'engine_code']
+    if not all(vehicle_data.get(field) for field in required_fields):
+        return list(tags)  # Return empty tags if any required field is missing
+
+    # Now we know all required fields are non-None, so the query should be safe
     vehicle = Vehicle.query.filter(
         (Vehicle.brand.ilike(vehicle_data['brand'])) &
         (Vehicle.model.ilike(vehicle_data['model'])) &
