@@ -1,7 +1,11 @@
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify
 import requests
 import re
 import os
+import hmac
+import hashlib
+import base64
+import json
 from flask_sqlalchemy import SQLAlchemy
 from dotenv import load_dotenv
 
@@ -25,96 +29,93 @@ class Vehicle(db.Model):
     fuel_type = db.Column(db.String(20))
     displacement = db.Column(db.String(20))
     power = db.Column(db.String(20))
-    type = db.Column(db.String(50))  # Added 'type' field to match Mecaparts
+    type = db.Column(db.String(50))
 
-# Inițializare baza de date
+# Inițializare baza de date (fără date mock)
 with app.app_context():
     db.create_all()
-    # Add sample data if the table is empty
-    if not Vehicle.query.first():
-        vehicles = [
-            Vehicle(brand="BMW", model="3 Series", type="E90 320d", generation="MK5", engine_code="N47", engine_name="2.0L Diesel", fuel_type="Diesel", displacement="2.0L", power="184HP"),
-            Vehicle(brand="BMW", model="3 Series", type="E90 325i", generation="MK5", engine_code="N52", engine_name="2.5L Petrol", fuel_type="Petrol", displacement="2.5L", power="218HP"),
-            Vehicle(brand="Audi", model="A4", type="B8 2.0 TDI", generation="B8", engine_code="CAGA", engine_name="2.0L TDI", fuel_type="Diesel", displacement="2.0L", power="143HP"),
-            Vehicle(brand="Mercedes", model="C-Class", type="W204 220 CDI", generation="W204", engine_code="OM651", engine_name="2.2L Diesel", fuel_type="Diesel", displacement="2.2L", power="170HP")
-        ]
-        db.session.bulk_save_objects(vehicles)
-        db.session.commit()
+
+# Încărcare configurație din fișier
+CONFIG_PATH = os.getenv('CONFIG_PATH', 'config.json')
+try:
+    with open(CONFIG_PATH, 'r') as config_file:
+        config = json.load(config_file)
+except FileNotFoundError:
+    app.logger.error(f"Config file not found at {CONFIG_PATH}. Using default configuration.")
+    config = {
+        "patterns": {
+            "brand": r'\b[A-Z][a-zA-Z]+\b',  # Generic pattern for brand names
+            "model": r'\b[A-Z0-9-]+\b',      # Generic pattern for models
+            "generation": r'\b(MK[IVXLCDM]+|[A-Z]\d+)\b',
+            "engine": r'\b\d+\.\d+\s*[A-Za-z]*\b',
+            "engine_code": r'\b[A-Z0-9]{3,6}\b',
+            "type": r'\b[A-Z0-9]+\s*\d+\.\d+[A-Za-z]*\b'
+        },
+        "non_vehicle_keywords": ["shirt", "book", "phone", "laptop", "jacket", "toy"]
+    }
 
 # Configurare Shopify
 SHOPIFY_DOMAIN = os.getenv("SHOPIFY_DOMAIN")
 ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
-STOREFRONT_ACCESS_TOKEN = os.getenv("SHOPIFY_STOREFRONT_ACCESS_TOKEN")
+SHOPIFY_SECRET = os.getenv("SHOPIFY_SECRET")  # Webhook secret for verification
+
+def verify_webhook(data, hmac_header):
+    """Verify the Shopify webhook signature"""
+    digest = hmac.new(
+        SHOPIFY_SECRET.encode('utf-8'),
+        data,
+        hashlib.sha256
+    ).digest()
+    computed_hmac = base64.b64encode(digest).decode('utf-8')
+    return hmac.compare_digest(computed_hmac, hmac_header)
 
 def normalize_text(text):
-    """Normalizează textul pentru comparații sigure"""
+    """Normalize text for safe comparisons"""
     if not text:
         return None
     return re.sub(r'\W+', ' ', text).strip().lower()
 
 def extract_vehicle_data(title):
-    """Extrage date despre vehicul folosind expresii regulate"""
-    # Log the product title for debugging
+    """Extract vehicle data using configurable regex patterns"""
     app.logger.info(f"Processing product title: '{title}'")
-
-    # If the title is empty or clearly not vehicle-related, skip processing
-    if not title or any(keyword in title.lower() for keyword in ['shirt', 'book', 'phone', 'laptop', 'jacket', 'toy']):
+    if not title or any(keyword in title.lower() for keyword in config['non_vehicle_keywords']):
         app.logger.info("Skipping non-vehicle product title")
         return {'brand': None, 'model': None, 'generation': None, 'engine': None, 'engine_code': None, 'type': None}
 
-    # Expanded patterns to match more brands, models, etc.
-    patterns = {
-        'brand': r'\b(BMW|Audi|VW|Volkswagen|Ford|Opel|Dacia|Mercedes|Toyota|Honda|Peugeot|Renault|Skoda|Seat|Hyundai|Kia|Nissan|Mitsubishi|Lexus|Chevrolet|Porsche|Volvo|Citroen|Mazda|Subaru|Jeep|Land Rover)\b',
-        'model': r'\b(3 Series|5 Series|E90|E46|E39|E60|E36|Golf|A4|A6|A3|Focus|Duster|Astra|C-Class|E-Class|S-Class|Corolla|Civic|Clio|Megane|Octavia|Ibiza|Tucson|Sportage|Skyline|Supra|RX|Camry|Accord|Fiesta|Passat|Leon|Fabia|Kona|Santa Fe|Outlander|Impreza|Wrangler|Range Rover)\b',
-        'generation': r'\b(MK[IVXLCDM]+|B\d+|G\d+|W\d+|F\d+|E\d+)\b',
-        'engine': r'\b(\d+\.\d+\s*(TFSI|TSI|TDI|HDi|dCi|[TLS]?[FS]?I)?)\b',
-        'engine_code': r'\b(N47|BKC|CAGA|K9K|CDNA|OM642|K4M|EA888|M54|M62|B58|S55|4JJ1|1KD|2JZ|RB26)\b',
-        'type': r'\b(E90 320d|E90 325i|B8 2\.0 TDI|W204 220 CDI|[A-Z0-9]+\s*\d+\.\d+[A-Za-z]*)\b'
-    }
-    
+    patterns = config['patterns']
     result = {}
     for key, pattern in patterns.items():
         match = re.search(pattern, title, re.IGNORECASE)
         result[key] = normalize_text(match.group(0)) if match else None
     
-    # Fallback: If brand, model, or type is None, try a more general approach
+    # Fallback logic to guess fields if patterns don't match
     if not result.get('brand') or not result.get('model') or not result.get('type'):
         words = title.split()
         for i, word in enumerate(words):
-            # Try to guess the brand (word that looks like a brand name)
-            if not result.get('brand') and re.match(r'^[A-Z][a-zA-Z]+$', word):
+            if not result.get('brand') and re.match(patterns['brand'], word, re.IGNORECASE):
                 result['brand'] = normalize_text(word)
-            # Try to guess the model (next word after brand or a word with numbers/letters)
-            elif (result.get('brand') or i > 0) and not result.get('model') and re.match(r'^[A-Z0-9-]+$', word):
+            elif (result.get('brand') or i > 0) and not result.get('model') and re.match(patterns['model'], word, re.IGNORECASE):
                 result['model'] = normalize_text(word)
-            # Try to guess the type (e.g., "E90 320d" or "W204 220 CDI")
-            elif not result.get('type') and re.match(r'^[A-Z0-9]+\s*\d+\.\d+[A-Za-z]*$', word + (f" {words[i+1]}" if i+1 < len(words) else "")):
+            elif not result.get('type') and re.match(patterns['type'], word + (f" {words[i+1]}" if i+1 < len(words) else ""), re.IGNORECASE):
                 result['type'] = normalize_text(word + (f" {words[i+1]}" if i+1 < len(words) else ""))
-            # Try to guess the engine if not found (look for a number like 2.0)
-            elif not result.get('engine') and re.match(r'^\d+\.\d+$', word):
+            elif not result.get('engine') and re.match(patterns['engine'], word, re.IGNORECASE):
                 result['engine'] = normalize_text(word)
-            # Try to guess the engine code (word with letters and numbers)
-            elif not result.get('engine_code') and re.match(r'^[A-Z0-9]{3,6}$', word):
+            elif not result.get('engine_code') and re.match(patterns['engine_code'], word, re.IGNORECASE):
                 result['engine_code'] = normalize_text(word)
     
-    # Log the extracted data
     app.logger.info(f"Extracted vehicle data: {result}")
     return result
 
 def get_vehicle_tags(vehicle_data):
-    """Generează etichete bazate pe datele vehiculului"""
+    """Generate tags based on vehicle data"""
     tags = set()
-
-    # Log the vehicle_data for debugging
     app.logger.info(f"vehicle_data in get_vehicle_tags: {vehicle_data}")
 
-    # Check if required fields are None; if so, return empty tags
     required_fields = ['brand', 'model', 'type']
     if not all(vehicle_data.get(field) for field in required_fields):
         app.logger.warning(f"Skipping query due to missing vehicle data: {vehicle_data}")
         return list(tags)
 
-    # Query the database for a matching vehicle
     vehicle = Vehicle.query.filter(
         (Vehicle.brand.ilike(vehicle_data['brand'])) &
         (Vehicle.model.ilike(vehicle_data['model'])) &
@@ -135,6 +136,21 @@ def get_vehicle_tags(vehicle_data):
             tags.add(vehicle.displacement)
         if vehicle.generation:
             tags.add(vehicle.generation)
+    else:
+        # If no vehicle is found in the database, use extracted data to generate basic tags
+        tags.add(vehicle_data['brand'])
+        tags.add(vehicle_data['model'])
+        tags.add(vehicle_data['type'])
+        tags.add(f"{vehicle_data['brand']} {vehicle_data['model']}")
+        tags.add(f"{vehicle_data['brand']} {vehicle_data['model']} {vehicle_data['type']}")
+        if vehicle_data.get('engine_code'):
+            tags.add(vehicle_data['engine_code'])
+        if vehicle_data.get('fuel_type'):
+            tags.add(vehicle_data['fuel_type'])
+        if vehicle_data.get('displacement'):
+            tags.add(vehicle_data['displacement'])
+        if vehicle_data.get('generation'):
+            tags.add(vehicle_data['generation'])
         
     return list(tags)
 
@@ -144,8 +160,6 @@ def create_or_update_collection(collection_title, tag):
         "Content-Type": "application/json",
         "X-Shopify-Access-Token": ACCESS_TOKEN
     }
-
-    # Check if the collection already exists
     response = requests.get(
         f"https://{SHOPIFY_DOMAIN}/admin/api/2023-10/custom_collections.json",
         headers=headers
@@ -159,7 +173,6 @@ def create_or_update_collection(collection_title, tag):
             collection_id = collection['id']
             break
 
-    # Create or update the collection
     payload = {
         "custom_collection": {
             "title": collection_title,
@@ -178,14 +191,12 @@ def create_or_update_collection(collection_title, tag):
     }
 
     if collection_id:
-        # Update existing collection
         response = requests.put(
             f"https://{SHOPIFY_DOMAIN}/admin/api/2023-10/custom_collections/{collection_id}.json",
             json=payload,
             headers=headers
         )
     else:
-        # Create new collection
         response = requests.post(
             f"https://{SHOPIFY_DOMAIN}/admin/api/2023-10/custom_collections.json",
             json=payload,
@@ -215,19 +226,34 @@ def add_product_to_collection(product_id, collection_id):
 
 @app.route("/webhook/products/create", methods=["POST"])
 def handle_product_create():
+    """Handle Shopify product creation webhook"""
+    app.logger.info("Received webhook request for product creation")
+    
+    # Verify the webhook
+    hmac_header = request.headers.get('X-Shopify-Hmac-Sha256')
+    if not hmac_header:
+        app.logger.error("Missing X-Shopify-Hmac-Sha256 header")
+        return jsonify({"error": "Missing HMAC header"}), 401
+
+    data = request.get_data()
+    if not verify_webhook(data, hmac_header):
+        app.logger.error("Webhook verification failed")
+        return jsonify({"error": "Webhook verification failed"}), 401
+
     try:
         data = request.get_json()
+        app.logger.info(f"Webhook data: {data}")
         if not data or 'id' not in data:
+            app.logger.error("Invalid request: Missing product ID")
             return jsonify({"error": "Invalid request"}), 400
 
         product_id = data['id']
         title = data.get('title', '')
         
-        # Extrage și procesează date
         vehicle_data = extract_vehicle_data(title)
         tags = get_vehicle_tags(vehicle_data)
+        app.logger.info(f"Generated tags: {tags}")
         
-        # Actualizează produsul în Shopify
         if tags:
             headers = {
                 "Content-Type": "application/json",
@@ -245,13 +271,14 @@ def handle_product_create():
                 headers=headers
             )
             response.raise_for_status()
+            app.logger.info(f"Updated product {product_id} with tags: {tags}")
 
-            # Create or update collections based on tags
             for tag in tags:
-                if " " in tag:  # e.g., "BMW 3 Series E90 320d"
+                if " " in tag:
                     collection_title = f"{tag} Parts"
                     collection_id = create_or_update_collection(collection_title, tag)
                     add_product_to_collection(product_id, collection_id)
+                    app.logger.info(f"Added product {product_id} to collection: {collection_title}")
             
         return jsonify({"status": "success", "tags": tags}), 200
 
@@ -264,152 +291,10 @@ def handle_product_create():
 
 @app.route("/")
 def home():
+    """Basic health check endpoint"""
+    app.logger.info("Accessing home route")
     return "Vehicle AutoTagger Service"
 
-# Front-end route for vehicle selection and product filtering
-@app.route("/vehicle-selector", methods=["GET", "POST"])
-def vehicle_selector():
-    # Get all unique brands, models, and types from the database
-    brands = db.session.query(Vehicle.brand).distinct().all()
-    brands = [brand[0] for brand in brands if brand[0]]
-    
-    models = []
-    types = []
-    selected_brand = request.form.get("brand") if request.method == "POST" else None
-    selected_model = request.form.get("model") if request.method == "POST" else None
-
-    if selected_brand:
-        models = db.session.query(Vehicle.model).filter(Vehicle.brand == selected_brand).distinct().all()
-        models = [model[0] for model in models if model[0]]
-    
-    if selected_brand and selected_model:
-        types = db.session.query(Vehicle.type).filter(
-            (Vehicle.brand == selected_brand) & (Vehicle.model == selected_model)
-        ).distinct().all()
-        types = [type_[0] for type_ in types if type_[0]]
-
-    # If a brand, model, and type are selected, fetch products from Shopify
-    products = []
-    if request.method == "POST" and selected_brand and selected_model and request.form.get("type"):
-        selected_type = request.form.get("type")
-        tag = f"{selected_brand} {selected_model} {selected_type}".lower()
-
-        # Use Shopify Storefront API to fetch products with the tag
-        query = """
-        {
-          products(first: 10, query: "tag:%s") {
-            edges {
-              node {
-                id
-                title
-                handle
-                priceRange {
-                  minVariantPrice {
-                    amount
-                    currencyCode
-                  }
-                }
-              }
-            }
-          }
-        }
-        """ % tag
-
-        headers = {
-            "Content-Type": "application/json",
-            "X-Shopify-Storefront-Access-Token": STOREFRONT_ACCESS_TOKEN
-        }
-        response = requests.post(
-            f"https://{SHOPIFY_DOMAIN}/api/2023-10/graphql.json",
-            json={"query": query},
-            headers=headers
-        )
-        response.raise_for_status()
-        products_data = response.json().get('data', {}).get('products', {}).get('edges', [])
-        products = [edge['node'] for edge in products_data]
-
-    # Render the vehicle selector form and product list
-    html_template = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>TecDoc Search</title>
-        <style>
-            body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
-            .container { max-width: 1200px; margin: 0 auto; }
-            h1 { font-size: 24px; margin-bottom: 20px; }
-            .search-box { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
-            .form-group { margin-bottom: 15px; }
-            .form-group label { display: block; margin-bottom: 5px; font-weight: bold; }
-            .form-group select { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
-            .product { background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 15px; }
-            .product h3 { margin: 0 0 10px; font-size: 18px; }
-            .product p { margin: 0 0 10px; }
-            .product a { color: #007bff; text-decoration: none; }
-            .product a:hover { text-decoration: underline; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>TecDoc Search</h1>
-            <div class="search-box">
-                <form method="POST">
-                    <div class="form-group">
-                        <label for="vehicle-type">Vehicle Type</label>
-                        <select name="vehicle-type" id="vehicle-type" disabled>
-                            <option value="passenger-car">Passenger car</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label for="brand">Manufacturer</label>
-                        <select name="brand" id="brand" onchange="this.form.submit()">
-                            <option value="">-- Select Manufacturer --</option>
-                            {% for brand in brands %}
-                                <option value="{{ brand }}" {% if selected_brand == brand %}selected{% endif %}>{{ brand }}</option>
-                            {% endfor %}
-                        </select>
-                    </div>
-                    {% if models %}
-                    <div class="form-group">
-                        <label for="model">Model</label>
-                        <select name="model" id="model" onchange="this.form.submit()">
-                            <option value="">-- Select Model --</option>
-                            {% for model in models %}
-                                <option value="{{ model }}" {% if selected_model == model %}selected{% endif %}>{{ model }}</option>
-                            {% endfor %}
-                        </select>
-                    </div>
-                    {% endif %}
-                    {% if types %}
-                    <div class="form-group">
-                        <label for="type">Type</label>
-                        <select name="type" id="type" onchange="this.form.submit()">
-                            <option value="">-- Select Type --</option>
-                            {% for type in types %}
-                                <option value="{{ type }}">{{ type }}</option>
-                            {% endfor %}
-                        </select>
-                    </div>
-                    {% endif %}
-                </form>
-            </div>
-            {% if products %}
-            <h2>Compatible Parts</h2>
-            {% for product in products %}
-                <div class="product">
-                    <h3>{{ product.title }}</h3>
-                    <p>Price: {{ product.priceRange.minVariantPrice.amount }} {{ product.priceRange.minVariantPrice.currencyCode }}</p>
-                    <a href="https://{{ shopify_domain }}/products/{{ product.handle }}">View Product</a>
-                </div>
-            {% endfor %}
-            {% else %}
-            <p>Search for auto parts by selecting a vehicle above.</p>
-            {% endif %}
-        </div>
-    </body>
-    </html>
-    """
-    return render_template_string(html_template, brands=brands, models=models, types=types, selected_brand=selected_brand, selected_model=selected_model, products=products, shopify_domain=SHOPIFY_DOMAIN)
-
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=5002, debug=os.getenv('FLASK_DEBUG', False))
+    port = int(os.getenv('PORT', 5002))
+    app.run(host='0.0.0.0', port=port, debug=os.getenv('FLASK_DEBUG', 'False') == 'True')
