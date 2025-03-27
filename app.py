@@ -59,9 +59,13 @@ def get_vehicle_tags(vehicle_data):
     """Generează etichete bazate pe datele vehiculului"""
     tags = set()
 
+    # Log the vehicle_data for debugging
+    app.logger.info(f"vehicle_data: {vehicle_data}")
+
     # Check if required fields are None; if so, return empty tags
     required_fields = ['brand', 'model', 'engine_code']
     if not all(vehicle_data.get(field) for field in required_fields):
+        app.logger.warning(f"Skipping query due to missing vehicle data: {vehicle_data}")
         return list(tags)  # Return empty tags if any required field is missing
 
     # Now we know all required fields are non-None, so the query should be safe
