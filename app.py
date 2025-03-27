@@ -40,12 +40,16 @@ def normalize_text(text):
 
 def extract_vehicle_data(title):
     """Extrage date despre vehicul folosind expresii regulate"""
+    # Log the product title for debugging
+    app.logger.info(f"Processing product title: {title}")
+
+    # Expanded patterns to match more brands, models, etc.
     patterns = {
-        'brand': r'\b(BMW|Audi|VW|Volkswagen|Ford|Opel|Dacia)\b',
-        'model': r'\b(E90|Golf|A4|Focus|Duster|Astra)\b',
-        'generation': r'\b(MK[IVXLCDM]+|B\d+|G\d+)\b',
-        'engine': r'\b(\d+\.\d+\s*[TLS]?[FS]?I|dCi|TDI|HDi)\b',
-        'engine_code': r'\b(N47|BKC|CAGA|K9K)\b'
+        'brand': r'\b(BMW|Audi|VW|Volkswagen|Ford|Opel|Dacia|Mercedes|Toyota|Honda|Peugeot|Renault|Skoda|Seat|Hyundai|Kia)\b',
+        'model': r'\b(E90|E46|E39|Golf|A4|A6|Focus|Duster|Astra|C-Class|E-Class|Corolla|Civic|Clio|Megane|Octavia|Ibiza|Tucson|Sportage)\b',
+        'generation': r'\b(MK[IVXLCDM]+|B\d+|G\d+|W\d+)\b',
+        'engine': r'\b(\d+\.\d+\s*(TFSI|TSI|TDI|HDi|dCi|[TLS]?[FS]?I)?)\b',
+        'engine_code': r'\b(N47|BKC|CAGA|K9K|CDNA|OM642|K4M|EA888)\b'
     }
     
     result = {}
@@ -53,6 +57,19 @@ def extract_vehicle_data(title):
         match = re.search(pattern, title, re.IGNORECASE)
         result[key] = normalize_text(match.group(0)) if match else None
     
+    # Fallback: If brand or model is None, try a more general approach
+    if not result.get('brand') or not result.get('model'):
+        words = title.split()
+        for word in words:
+            # Try to guess the brand (first word that looks like a brand)
+            if not result.get('brand') and re.match(r'^[A-Z][a-z]+$', word):
+                result['brand'] = normalize_text(word)
+            # Try to guess the model (next word after brand)
+            elif result.get('brand') and not result.get('model') and re.match(r'^[A-Z0-9-]+$', word):
+                result['model'] = normalize_text(word)
+    
+    # Log the extracted data
+    app.logger.info(f"Extracted vehicle data: {result}")
     return result
 
 def get_vehicle_tags(vehicle_data):
@@ -60,7 +77,7 @@ def get_vehicle_tags(vehicle_data):
     tags = set()
 
     # Log the vehicle_data for debugging
-    app.logger.info(f"vehicle_data: {vehicle_data}")
+    app.logger.info(f"vehicle_data in get_vehicle_tags: {vehicle_data}")
 
     # Check if required fields are None; if so, return empty tags
     required_fields = ['brand', 'model', 'engine_code']
